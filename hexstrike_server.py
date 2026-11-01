@@ -28,6 +28,10 @@ import traceback
 import threading
 import time
 import hashlib
+import hmac
+import shlex
+from hexstrike_security import (is_loopback_host, validate_config, validate_token,
+                                positive_int, boolean_env)
 import pickle
 import base64
 import queue
@@ -94,9 +98,54 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
 
-# API Configuration
-API_PORT = int(os.environ.get('HEXSTRIKE_PORT', 8888))
-API_HOST = os.environ.get('HEXSTRIKE_HOST', '127.0.0.1')
+# Validate configuration on import too, so WSGI cannot silently bypass policy.
+API_PORT = positive_int(os.environ.get('HEXSTRIKE_PORT', '8888'))
+API_HOST = os.environ.get('HEXSTRIKE_HOST', os.environ.get('API_HOST', '127.0.0.1'))
+API_TOKEN = validate_token(os.environ.get('HEXSTRIKE_API_TOKEN', ''))
+ALLOW_UNAUTHENTICATED_LOCAL = boolean_env(os.environ.get('HEXSTRIKE_ALLOW_UNAUTHENTICATED_LOCAL', '0'))
+validate_config(API_HOST, API_PORT, API_TOKEN, ALLOW_UNAUTHENTICATED_LOCAL,
+                require_credentials=False)
+
+@app.before_request
+def require_api_token():
+    """Protect every route before parsing input or running any handler.
+
+    Never trust forwarded headers as evidence of a local connection.
+    Token-free local access is an explicit, single-user compatibility mode.
+    """
+    if API_TOKEN:
+        supplied = request.headers.get("Authorization", "").encode()
+        expected = f"Bearer {API_TOKEN}".encode()
+        if not hmac.compare_digest(supplied, expected):
+            return jsonify({"error": "Unauthorized"}), 401, {"WWW-Authenticate": "Bearer"}
+        return None
+    if not ALLOW_UNAUTHENTICATED_LOCAL:
+        return jsonify({"error": "API authentication is not configured"}), 503
+    try:
+        host = urllib.parse.urlsplit(f"//{request.host}")
+        local_host = (is_loopback_host(host.hostname or "") and
+                      host.username is None and host.password is None and
+                      not host.path and not host.query and not host.fragment)
+        # Accessing port also rejects malformed ports.
+        host.port
+    except ValueError:
+        local_host = False
+    if (not is_loopback_host(API_HOST) or not local_host or
+            not is_loopback_host(request.remote_addr) or
+            any(name in request.headers for name in ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP")) or
+            request.headers.get("Origin") is not None or
+            request.headers.get("Sec-Fetch-Site", "none") != "none"):
+        return jsonify({"error": "Forbidden: local compatibility mode only"}), 403
+
+def contained_path(base_dir: Path, name: str) -> Path:
+    """Resolve name under base_dir, refusing absolute paths and '..' escapes"""
+    if not isinstance(name, str) or Path(name).is_absolute() or '..' in Path(name).parts:
+        raise ValueError("Expected a relative path without '..'")
+    base = base_dir.resolve()
+    path = (base / name).resolve()
+    if path != base and base not in path.parents:
+        raise ValueError(f"Path escapes {base}: {name}")
+    return path
 
 # ============================================================================
 # MODERN VISUAL ENGINE (v2.0 ENHANCEMENT)
@@ -5711,7 +5760,9 @@ class PythonEnvironmentManager:
 
     def create_venv(self, env_name: str) -> Path:
         """Create a new virtual environment"""
-        env_path = self.base_dir / env_name
+        env_path = contained_path(self.base_dir, env_name)
+        if env_path == self.base_dir.resolve():
+            raise ValueError("Environment name is required")
         if not env_path.exists():
             logger.info(f"🐍 Creating virtual environment: {env_name}")
             venv.create(env_path, with_pip=True)
@@ -6661,7 +6712,7 @@ def setup_logging():
 
 # Configuration (using existing API_PORT from top of file)
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "0").lower() in ("1", "true", "yes", "y")
-COMMAND_TIMEOUT = 300  # 5 minutes default timeout
+COMMAND_TIMEOUT = positive_int(os.environ.get("HEXSTRIKE_COMMAND_TIMEOUT", 300))  # 5 minutes default timeout (override with HEXSTRIKE_COMMAND_TIMEOUT or --timeout)
 CACHE_SIZE = 1000
 CACHE_TTL = 3600  # 1 hour
 
@@ -6783,9 +6834,10 @@ telemetry = TelemetryCollector()
 class EnhancedCommandExecutor:
     """Enhanced command executor with caching, progress tracking, and better output handling"""
 
-    def __init__(self, command: str, timeout: int = COMMAND_TIMEOUT):
+    def __init__(self, command: str, timeout: int = None):
         self.command = command
-        self.timeout = timeout
+        # Resolve the default at call time so --timeout set at startup is honored
+        self.timeout = COMMAND_TIMEOUT if timeout is None else positive_int(timeout)
         self.process = None
         self.stdout_data = ""
         self.stderr_data = ""
@@ -8633,31 +8685,34 @@ cve_intelligence = CVEIntelligenceManager()
 exploit_generator = AIExploitGenerator()
 vulnerability_correlator = VulnerabilityCorrelator()
 
-def execute_command(command: str, use_cache: bool = True) -> Dict[str, Any]:
+def execute_command(command: str, use_cache: bool = True, timeout: int = None) -> Dict[str, Any]:
     """
     Execute a shell command with enhanced features
 
     Args:
         command: The command to execute
         use_cache: Whether to use caching for this command
+        timeout: Seconds before the command is terminated (default: COMMAND_TIMEOUT)
 
     Returns:
         A dictionary containing the stdout, stderr, return code, and metadata
     """
 
+    timeout = COMMAND_TIMEOUT if timeout is None else positive_int(timeout)
+    cache_parameters = {"timeout": timeout}
     # Check cache first
     if use_cache:
-        cached_result = cache.get(command, {})
+        cached_result = cache.get(command, cache_parameters)
         if cached_result:
             return cached_result
 
     # Execute command
-    executor = EnhancedCommandExecutor(command)
+    executor = EnhancedCommandExecutor(command, timeout=timeout)
     result = executor.execute()
 
-    # Cache successful results
-    if use_cache and result.get("success", False):
-        cache.set(command, {}, result)
+    # Cache successful results (partial output from a timed-out run is not cached)
+    if use_cache and result.get("success", False) and not result.get("timed_out", False):
+        cache.set(command, cache_parameters, result)
 
     return result
 
@@ -8936,7 +8991,7 @@ class FileOperationsManager:
     def create_file(self, filename: str, content: str, binary: bool = False) -> Dict[str, Any]:
         """Create a file with the specified content"""
         try:
-            file_path = self.base_dir / filename
+            file_path = contained_path(self.base_dir, filename)
             file_path.parent.mkdir(parents=True, exist_ok=True)
 
             if len(content.encode()) > self.max_file_size:
@@ -8959,7 +9014,7 @@ class FileOperationsManager:
     def modify_file(self, filename: str, content: str, append: bool = False) -> Dict[str, Any]:
         """Modify an existing file"""
         try:
-            file_path = self.base_dir / filename
+            file_path = contained_path(self.base_dir, filename)
             if not file_path.exists():
                 return {"success": False, "error": "File does not exist"}
 
@@ -8977,7 +9032,9 @@ class FileOperationsManager:
     def delete_file(self, filename: str) -> Dict[str, Any]:
         """Delete a file or directory"""
         try:
-            file_path = self.base_dir / filename
+            file_path = contained_path(self.base_dir, filename)
+            if file_path == self.base_dir.resolve():
+                return {"success": False, "error": "Refusing to delete the base directory"}
             if not file_path.exists():
                 return {"success": False, "error": "File does not exist"}
 
@@ -8996,7 +9053,7 @@ class FileOperationsManager:
     def list_files(self, directory: str = ".") -> Dict[str, Any]:
         """List files in a directory"""
         try:
-            dir_path = self.base_dir / directory
+            dir_path = contained_path(self.base_dir, directory)
             if not dir_path.exists():
                 return {"success": False, "error": "Directory does not exist"}
 
@@ -9141,6 +9198,7 @@ def generic_command():
         params = request.json
         command = params.get("command", "")
         use_cache = params.get("use_cache", True)
+        timeout = params.get("timeout")
 
         if not command:
             logger.warning("⚠️  Command endpoint called without command parameter")
@@ -9148,7 +9206,12 @@ def generic_command():
                 "error": "Command parameter is required"
             }), 400
 
-        result = execute_command(command, use_cache=use_cache)
+        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0):
+            return jsonify({
+                "error": "Timeout must be a positive integer (seconds)"
+            }), 400
+
+        result = execute_command(command, use_cache=use_cache, timeout=timeout)
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in command endpoint: {str(e)}")
@@ -13671,6 +13734,11 @@ class BrowserAgent:
 
     def navigate_and_inspect(self, url: str, wait_time: int = 5) -> dict:
         """Navigate to URL and perform comprehensive inspection"""
+        # file://, javascript:, data: and similar schemes would read local files
+        # or run script in the browser, so only web URLs are allowed.
+        scheme = urlparse(url).scheme.lower()
+        if scheme not in ('http', 'https'):
+            return {'success': False, 'error': f'Unsupported URL scheme: {scheme or "(none)"}'}
         try:
             if not self.driver:
                 if not self.setup_browser():
@@ -14517,7 +14585,7 @@ def execute_python_script():
         script_path = script_result["path"]
 
         # Execute script
-        command = f"{python_path} {script_path}"
+        command = f"{shlex.quote(python_path)} {shlex.quote(script_path)}"
         logger.info(f"🐍 Executing Python script in env {env_name}: {filename}")
         result = execute_command(command, use_cache=False)
 
@@ -17254,12 +17322,12 @@ def get_alternative_tools():
 BANNER = ModernVisualEngine.create_banner()
 
 if __name__ == "__main__":
-    # Display the beautiful new banner
-    print(BANNER)
-
     parser = argparse.ArgumentParser(description="Run the HexStrike AI API Server")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("--port", type=int, default=API_PORT, help=f"Port for the API server (default: {API_PORT})")
+    parser.add_argument("--host", type=str, default=API_HOST, help=f"Address to listen on (default: {API_HOST})")
+    parser.add_argument("--timeout", type=positive_int, default=COMMAND_TIMEOUT,
+                        help="Server command timeout in seconds (env: HEXSTRIKE_COMMAND_TIMEOUT)")
     args = parser.parse_args()
 
     if args.debug:
@@ -17269,12 +17337,24 @@ if __name__ == "__main__":
     if args.port != API_PORT:
         API_PORT = args.port
 
+    API_HOST = args.host
+
+    COMMAND_TIMEOUT = args.timeout
+    try:
+        validate_config(API_HOST, API_PORT, API_TOKEN, ALLOW_UNAUTHENTICATED_LOCAL, DEBUG_MODE)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    # Render only after CLI overrides and security validation.
+    print(ModernVisualEngine.create_banner())
+
     # Enhanced startup messages with beautiful formatting
     startup_info = f"""
 {ModernVisualEngine.COLORS['MATRIX_GREEN']}{ModernVisualEngine.COLORS['BOLD']}╭─────────────────────────────────────────────────────────────────────────────╮{ModernVisualEngine.COLORS['RESET']}
 {ModernVisualEngine.COLORS['BOLD']}│{ModernVisualEngine.COLORS['RESET']} {ModernVisualEngine.COLORS['NEON_BLUE']}🚀 Starting HexStrike AI Tools API Server{ModernVisualEngine.COLORS['RESET']}
 {ModernVisualEngine.COLORS['BOLD']}├─────────────────────────────────────────────────────────────────────────────┤{ModernVisualEngine.COLORS['RESET']}
-{ModernVisualEngine.COLORS['BOLD']}│{ModernVisualEngine.COLORS['RESET']} {ModernVisualEngine.COLORS['CYBER_ORANGE']}🌐 Port:{ModernVisualEngine.COLORS['RESET']} {API_PORT}
+{ModernVisualEngine.COLORS['BOLD']}│{ModernVisualEngine.COLORS['RESET']} {ModernVisualEngine.COLORS['CYBER_ORANGE']}🌐 Listening:{ModernVisualEngine.COLORS['RESET']} {API_HOST}:{API_PORT}
+{ModernVisualEngine.COLORS['BOLD']}│{ModernVisualEngine.COLORS['RESET']} {ModernVisualEngine.COLORS['CYBER_ORANGE']}🔐 API Token:{ModernVisualEngine.COLORS['RESET']} {'required' if API_TOKEN else 'not set (loopback only)'}
 {ModernVisualEngine.COLORS['BOLD']}│{ModernVisualEngine.COLORS['RESET']} {ModernVisualEngine.COLORS['WARNING']}🔧 Debug Mode:{ModernVisualEngine.COLORS['RESET']} {DEBUG_MODE}
 {ModernVisualEngine.COLORS['BOLD']}│{ModernVisualEngine.COLORS['RESET']} {ModernVisualEngine.COLORS['ELECTRIC_PURPLE']}💾 Cache Size:{ModernVisualEngine.COLORS['RESET']} {CACHE_SIZE} | TTL: {CACHE_TTL}s
 {ModernVisualEngine.COLORS['BOLD']}│{ModernVisualEngine.COLORS['RESET']} {ModernVisualEngine.COLORS['TERMINAL_GRAY']}⏱️  Command Timeout:{ModernVisualEngine.COLORS['RESET']} {COMMAND_TIMEOUT}s
@@ -17286,4 +17366,5 @@ if __name__ == "__main__":
         if line.strip():
             logger.info(line)
 
-    app.run(host="0.0.0.0", port=API_PORT, debug=DEBUG_MODE)
+    app.run(host=API_HOST, port=API_PORT, debug=DEBUG_MODE,
+            use_debugger=False, use_reloader=False)
