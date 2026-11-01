@@ -19,6 +19,7 @@ Framework: FastMCP integration for tool orchestration
 
 import sys
 import os
+from hexstrike_security import validate_token
 import argparse
 import logging
 from typing import Dict, Any, Optional
@@ -158,6 +159,9 @@ class HexStrikeClient:
         self.server_url = server_url.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
+        api_token = validate_token(os.environ.get("HEXSTRIKE_API_TOKEN", ""))
+        if api_token:
+            self.session.headers["Authorization"] = f"Bearer {api_token}"
 
         # Try to connect to server with retries
         connected = False

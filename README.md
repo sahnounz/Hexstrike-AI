@@ -3,6 +3,13 @@
 <img src="assets/hexstrike-logo.png" alt="HexStrike AI Logo" width="220" style="margin-bottom: 20px;"/>
 
 # HexStrike AI MCP Agents v6.0
+
+> **API security update:** A token is now required by default, including for local
+> MCP clients and health checks. Read [SECURITY.md](SECURITY.md) before starting
+> the server or exposing it remotely. Existing token-free local setups require an
+> explicit compatibility setting. Server command timeouts now support
+> `HEXSTRIKE_COMMAND_TIMEOUT` and `--timeout`.
+
 ### AI-Powered MCP Cybersecurity Automation Platform
 
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
